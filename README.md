@@ -48,8 +48,11 @@ To remove everything: `make uninstall`.
 ## Using the panel
 
 - **Slider:** monitor brightness.
-- **Sleep Monitor:** puts the monitor in standby. Click again to wake it. The
-  monitor stays connected, so it keeps charging the Mac.
+- **Sleep Monitor:** puts the monitor in standby and mirrors it onto the Mac's
+  built-in screen, so windows that were on the monitor stay reachable. Click
+  again to wake it and stop mirroring. The monitor stays connected, so it keeps
+  charging the Mac. Switching the mirror makes the built-in screen (and the
+  menu bar) flash briefly; macOS does this on any display change.
 - **Run on Battery:** stops drawing power from the adapter. Changing this needs
   administrator rights, so macOS asks for your password the first time (see
   [Skipping the password prompt](#skipping-the-password-prompt)).
@@ -63,9 +66,7 @@ asleep), bolt with a slash (adapter off), warning triangle (last action failed).
 monitorctl menubar                      run the menu bar app
 monitorctl [-d N] off | on              monitor standby / wake
 monitorctl [-d N] brightness [0-100]    get or set brightness
-monitorctl [-d N] vcp get|set ...       raw DDC/CI VCP access
-monitorctl status                       show DDC brightness and the adapter key
-monitorctl keys [prefix]                list SMC keys (for debugging)
+monitorctl status                       show DDC brightness and adapter state
 sudo monitorctl adapter off|on          run on battery / draw from the adapter
 ```
 
@@ -83,6 +84,9 @@ controls the first one.
   requires root. The change takes 5 to 10 seconds to show up and resets on
   reboot. On older macOS versions the `CH0B`/`CH0C`/`CHTE` keys did this job;
   they no longer exist on macOS 27, so this tool only uses `CHIE`.
+- **Windows.** Because macOS keeps a standby monitor attached, windows would
+  stay on its dark screen. Sleep Monitor therefore mirrors the external display
+  onto the built-in one (a public CoreGraphics call) and undoes it on wake.
 - **Safety.** If the adapter is off and the battery falls to 15%, the app turns
   the adapter back on.
 - **Visibility.** The app keeps running in the background and shows the icon
@@ -112,7 +116,11 @@ if the binary stays root-owned.
 - Some monitors ignore the DDC standby command, and some docks and adapters do
   not pass DDC through. The panel then reports that the monitor did not
   respond.
-- Only the first external display is controlled from the menu bar.
+- Only the first external display is controlled from the menu bar. With several
+  external displays, all of them are mirrored while the monitor sleeps.
+- The brief screen flash when mirroring starts or stops cannot be avoided.
+- If a display ever stays blank after a failed wake, unplug and replug the
+  USB-C cable, or restart the Mac. Nothing this tool changes survives a reboot.
 - Not tested on Intel Macs, which use a different DDC path.
 
 ## License

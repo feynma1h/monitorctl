@@ -4,7 +4,8 @@
  *   1. Put an external monitor into standby / wake it via DDC, leaving the
  *      USB-C link up so the monitor keeps charging the Mac.
  *   2. Stop drawing power from the adapter (run on battery) via the SMC (needs root).
- *   3. `menubar` mode: all of the above as a menu bar item.
+ *   3. `menubar` mode: all of the above as a menu bar item. Sleeping the monitor also
+ *      mirrors it onto the built-in screen so open windows stay reachable.
  *
  * Build:  make        (see the Makefile and README.md)
  *
@@ -12,7 +13,7 @@
  *   monitorctl menubar                 run the menu bar app
  *   monitorctl [-d N] off | on         monitor standby / wake
  *   monitorctl [-d N] brightness [0-100]   get or set brightness
- *   monitorctl status                  show DDC brightness and charge keys
+ *   monitorctl status                  show DDC brightness and adapter state
  *   sudo monitorctl adapter off|on     run on battery / draw from the adapter
  *
  * -d N picks the Nth external display (default 0) if you have more than one.
@@ -74,6 +75,42 @@ static IOAVServiceRef find_external(int index) {
     return found;
 }
 
+/*
+ * While the monitor is in standby macOS still treats it as attached, so windows
+ * stay on a dark screen. Mirroring the external display onto the built-in one
+ * pulls them back; stopping the mirror lets them return when the monitor wakes.
+ */
+static void set_external_mirroring(BOOL mirror) {
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return;
+    CGDirectDisplayID builtin = kCGNullDirectDisplay;
+    for (uint32_t i = 0; i < n; i++) if (CGDisplayIsBuiltin(ids[i])) builtin = ids[i];
+    if (builtin == kCGNullDirectDisplay) return;
+
+    BOOL needed = NO;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == builtin) continue;
+        BOOL mirrored = CGDisplayMirrorsDisplay(ids[i]) == builtin;
+        if (mirror != mirrored) needed = YES;
+    }
+    if (!needed) return;
+
+    CGDisplayConfigRef cfg;
+    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == builtin) continue;
+        if (!mirror && CGDisplayMirrorsDisplay(ids[i]) != builtin) continue;
+        CGConfigureDisplayMirrorOfDisplay(cfg, ids[i], mirror ? builtin : kCGNullDirectDisplay);
+    }
+    if (CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession) != kCGErrorSuccess)
+        CGCancelDisplayConfiguration(cfg);
+}
+
+/* Standby: gather the windows on the Mac screen. Wake: let them go back. */
+static void external_gather(void)  { set_external_mirroring(YES); }
+static void external_release(void) { set_external_mirroring(NO); }
+
 static BOOL external_present(int index) {
     IOAVServiceRef s = find_external(index);
     if (s) CFRelease(s);
@@ -114,13 +151,6 @@ static int ddc_read(IOAVServiceRef s, uint8_t vcp, uint16_t *cur, uint16_t *max)
     return -1;
 }
 
-static const char *state_path(void) {
-    static char p[1024];
-    const char *home = getenv("HOME");
-    snprintf(p, sizeof p, "%s/.monitorctl_brightness", home ? home : "/tmp");
-    return p;
-}
-
 /* ------------------------------------------------------------------ */
 /* SMC                                                                 */
 /* ------------------------------------------------------------------ */
@@ -143,7 +173,6 @@ _Static_assert(sizeof(SMCParam) == 80, "SMCParam must be 80 bytes");
 #define SMC_SELECTOR      2
 #define SMC_READ_BYTES    5
 #define SMC_WRITE_BYTES   6
-#define SMC_READ_INDEX    8
 #define SMC_READ_KEYINFO  9
 
 static io_connect_t smc_open(void) {
@@ -205,67 +234,13 @@ static int key_exists(io_connect_t c, const char *key) {
     return smc_keyinfo(c, key, &sz) == 0;
 }
 
-/* Battery charging. Works on older macOS only; macOS 27 removed these keys. */
-static int set_charging(io_connect_t c, int enable) {
-    if (key_exists(c, "CHTE")) {
-        uint8_t v[4] = {enable ? 0 : 1, 0, 0, 0};
-        return smc_write(c, "CHTE", v, 4);
-    }
-    if (key_exists(c, "CH0B") && key_exists(c, "CH0C")) {
-        uint8_t v = enable ? 0x00 : 0x02;
-        return smc_write(c, "CH0B", &v, 1) | smc_write(c, "CH0C", &v, 1);
-    }
-    return -2;
-}
-
 /* Adapter: run on battery even though power is connected. */
 static int set_adapter(io_connect_t c, int enable) {
     if (key_exists(c, "CHIE")) {
         uint8_t v = enable ? 0x00 : 0x08;
         return smc_write(c, "CHIE", &v, 1);
     }
-    if (key_exists(c, "CH0J")) {
-        uint8_t v = enable ? 0x00 : 0x20;
-        return smc_write(c, "CH0J", &v, 1);
-    }
     return -2;
-}
-
-static void print_key(io_connect_t c, const char *key) {
-    uint8_t b[32]; uint32_t n;
-    if (smc_read(c, key, b, &n) != 0) return;
-    printf("  %s =", key);
-    for (uint32_t i = 0; i < n; i++) printf(" %02x", b[i]);
-    printf("\n");
-}
-
-static int smc_key_at(io_connect_t c, uint32_t index, char name[5]) {
-    SMCParam in, out;
-    memset(&in, 0, sizeof in); memset(&out, 0, sizeof out);
-    in.data8 = SMC_READ_INDEX;
-    in.data32 = index;
-    if (smc_call(c, &in, &out) != 0) return -1;
-    name[0] = (char)(out.key >> 24); name[1] = (char)(out.key >> 16);
-    name[2] = (char)(out.key >> 8);  name[3] = (char)out.key;
-    name[4] = 0;
-    return 0;
-}
-
-static void list_keys(io_connect_t c, const char *prefix) {
-    uint8_t b[32]; uint32_t n;
-    if (smc_read(c, "#KEY", b, &n) != 0 || n != 4) { fprintf(stderr, "Could not read key count.\n"); return; }
-    uint32_t count = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
-    size_t plen = strlen(prefix);
-    for (uint32_t i = 0; i < count; i++) {
-        char name[5];
-        if (smc_key_at(c, i, name) != 0) continue;
-        if (strncmp(name, prefix, plen) != 0) continue;
-        uint8_t v[32]; uint32_t vn;
-        if (smc_read(c, name, v, &vn) != 0) { printf("  %s (unreadable)\n", name); continue; }
-        printf("  %s [%u] =", name, vn);
-        for (uint32_t j = 0; j < vn; j++) printf(" %02x", v[j]);
-        printf("\n");
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -734,11 +709,11 @@ static BOOL set_adapter_privileged(BOOL enable) {
     BOOL hasError = self.errorText != nil && [self.errorUntil timeIntervalSinceNow] > 0;
     if (!hasError) { self.errorText = nil; self.errorTile = 0; }
 
-    /* Menu bar icon: the symbol alone tells the state. */
+    /* Menu bar icon: always the display symbol (a warning triangle only after a failed action); state is in the panel and tooltip. */
     NSString *symbol, *summary;
     if (hasError)                { symbol = @"exclamationmark.triangle"; summary = self.errorText; }
-    else if (disabled)           { symbol = @"bolt.slash";               summary = @"Running on battery (adapter off)"; }
-    else if (self.monitorAsleep) { symbol = @"moon.zzz";                 summary = @"Monitor asleep"; }
+    else if (disabled)           { symbol = @"display";                  summary = @"monitorctl · running on battery"; }
+    else if (self.monitorAsleep) { symbol = @"display";                  summary = @"monitorctl · monitor asleep"; }
     else                         { symbol = @"display";                  summary = @"monitorctl"; }
     NSStatusBarButton *button = self.item.button;
     NSImage *img = [self symbol:symbol description:summary];
@@ -824,9 +799,11 @@ static BOOL set_adapter_privileged(BOOL enable) {
     self.monitorAsleep = goSleep;     /* show the change immediately; undo it if the monitor doesn't answer */
     [self refresh];
     dispatch_async(g_ddc_queue, ^{
+        if (!goSleep) external_release();
         IOAVServiceRef s = find_external(g_display_index);
         BOOL ok = s && ddc_write(s, VCP_POWER, goSleep ? 4 : 1) == 0;
         if (s) CFRelease(s);
+        if (ok && goSleep) external_gather();
         if (!ok) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.monitorAsleep = !goSleep;
@@ -876,6 +853,7 @@ static BOOL set_adapter_privileged(BOOL enable) {
         BOOL briOK = NO;
         if (powerOK && !asleep) briOK = ddc_read(s, VCP_BRIGHTNESS, &bcur, &bmax) == 0 && bmax > 0;
         if (s) CFRelease(s);
+        if (powerOK && !asleep) external_release();   /* woken some other way, e.g. the monitor's own button */
         dispatch_async(dispatch_get_main_queue(), ^{
             if (powerOK) self.monitorAsleep = asleep;
             if (briOK) {
@@ -922,11 +900,8 @@ static void usage(void) {
         "usage:\n"
         "  monitorctl menubar\n"
         "  monitorctl [-d N] off | on        (monitor standby / wake, stays connected)\n"
-        "  monitorctl [-d N] blank | restore | brightness [0-100]\n"
-        "  monitorctl [-d N] vcp get CODE | vcp set CODE VALUE   (raw DDC)\n"
+        "  monitorctl [-d N] brightness [0-100]\n"
         "  monitorctl status\n"
-        "  monitorctl keys [prefix]          (list SMC keys, default prefix CH)\n"
-        "  sudo monitorctl charge on|off     (battery charging; not available on macOS 27)\n"
         "  sudo monitorctl adapter on|off    (draw from the monitor / run on battery)\n");
     exit(2);
 }
@@ -939,24 +914,17 @@ int main(int argc, char **argv) {
 
     if (!strcmp(cmd, "menubar")) return run_menubar(idx);
 
-    if (!strcmp(cmd, "charge") || !strcmp(cmd, "adapter")) {
+    if (!strcmp(cmd, "adapter")) {
         if (a + 1 >= argc) usage();
         int on = !strcmp(argv[a + 1], "on");
         if (!on && strcmp(argv[a + 1], "off")) usage();
         if (geteuid() != 0) { fprintf(stderr, "Run this with sudo.\n"); return 1; }
         io_connect_t c = smc_open();
         if (!c) { fprintf(stderr, "Could not open the SMC.\n"); return 1; }
-        int r = !strcmp(cmd, "charge") ? set_charging(c, on) : set_adapter(c, on);
+        int r = set_adapter(c, on);
         if (r == -2) { fprintf(stderr, "No known SMC key for this Mac/macOS version.\n"); return 1; }
         if (r != 0)  { fprintf(stderr, "SMC write failed.\n"); return 1; }
-        printf("%s %s\n", cmd, on ? "on" : "off");
-        return 0;
-    }
-
-    if (!strcmp(cmd, "keys")) {
-        io_connect_t c = smc_open();
-        if (!c) { fprintf(stderr, "Could not open the SMC.\n"); return 1; }
-        list_keys(c, a + 1 < argc ? argv[a + 1] : "CH");
+        printf("adapter %s\n", on ? "on" : "off");
         return 0;
     }
 
@@ -967,12 +935,7 @@ int main(int argc, char **argv) {
             printf("Monitor brightness: %u / %u\n", cur, max);
         else
             printf("Monitor brightness: unavailable (no external display or DDC not responding)\n");
-        io_connect_t c = smc_open();
-        if (c) {
-            printf("SMC charge keys:\n");
-            print_key(c, "CHTE"); print_key(c, "CH0B"); print_key(c, "CH0C");
-            print_key(c, "CHIE"); print_key(c, "CH0J");
-        }
+        printf("Adapter: %s\n", adapter_disabled() ? "off (running on battery)" : "on");
         return 0;
     }
 
@@ -980,21 +943,7 @@ int main(int argc, char **argv) {
     if (!s) { fprintf(stderr, "No external display found (index %d).\n", idx); return 1; }
 
     uint16_t cur = 0, max = 100;
-    if (!strcmp(cmd, "blank")) {
-        if (ddc_read(s, VCP_BRIGHTNESS, &cur, &max) != 0) { fprintf(stderr, "Could not read brightness.\n"); return 1; }
-        if (cur > 0) {
-            FILE *f = fopen(state_path(), "w");
-            if (f) { fprintf(f, "%u\n", cur); fclose(f); }
-        }
-        if (ddc_write(s, VCP_BRIGHTNESS, 0) != 0) { fprintf(stderr, "Write failed.\n"); return 1; }
-        printf("Blanked (was %u).\n", cur);
-    } else if (!strcmp(cmd, "restore")) {
-        unsigned v = 70;
-        FILE *f = fopen(state_path(), "r");
-        if (f) { if (fscanf(f, "%u", &v) != 1) v = 70; fclose(f); }
-        if (ddc_write(s, VCP_BRIGHTNESS, (uint16_t)v) != 0) { fprintf(stderr, "Write failed.\n"); return 1; }
-        printf("Restored brightness to %u.\n", v);
-    } else if (!strcmp(cmd, "brightness")) {
+    if (!strcmp(cmd, "brightness")) {
         if (a + 1 < argc) {
             int v = atoi(argv[a + 1]);
             if (v < 0) v = 0;
@@ -1010,20 +959,6 @@ int main(int argc, char **argv) {
         int on = !strcmp(cmd, "on");
         if (ddc_write(s, VCP_POWER, on ? 1 : 4) != 0) { fprintf(stderr, "Write failed.\n"); return 1; }
         printf(on ? "Monitor on.\n" : "Monitor in standby.\n");
-    } else if (!strcmp(cmd, "vcp")) {
-        /* Raw DDC access for experiments: vcp get 0xD6 | vcp set 0xD6 4 */
-        if (a + 2 >= argc) usage();
-        uint8_t code = (uint8_t)strtoul(argv[a + 2], NULL, 0);
-        if (!strcmp(argv[a + 1], "get")) {
-            if (ddc_read(s, code, &cur, &max) != 0) { fprintf(stderr, "Read failed (code unsupported?).\n"); return 1; }
-            printf("0x%02X: %u (max %u)\n", code, cur, max);
-        } else if (!strcmp(argv[a + 1], "set") && a + 3 < argc) {
-            uint16_t v = (uint16_t)strtoul(argv[a + 3], NULL, 0);
-            if (ddc_write(s, code, v) != 0) { fprintf(stderr, "Write failed.\n"); return 1; }
-            printf("0x%02X set to %u.\n", code, v);
-        } else {
-            usage();
-        }
     } else {
         usage();
     }
